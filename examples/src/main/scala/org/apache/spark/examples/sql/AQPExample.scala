@@ -12,10 +12,15 @@ object AQPExample {
     val spark = SparkSession
       .builder()
       .appName("AQP Example")
+//      .config("spark.sql.codegen.wholeStage", value = false)
       .getOrCreate()
 
     val df = spark.read.json("examples/src/main/resources/people.json")
-    df.show()
+    val colexpr = df.col("name") =!= "Justin"
+    val colexpr2 = df.col("age") === 30
+    val dff = df.filter(colexpr && colexpr2)
+    dff.queryExecution.debug.codegen()
+    dff.show()
 
     spark.stop()
   }
