@@ -20,7 +20,7 @@ package org.apache.spark.sql.execution
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 
-import org.apache.spark.{InterruptibleIterator, SparkException, TaskContext}
+import org.apache.spark.{InterruptibleIterator, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.rdd.{EmptyRDD, PartitionwiseSampledRDD, RDD}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
@@ -145,6 +145,117 @@ case class FilterExec(condition: Expression, child: SparkPlan)
       } else {
         s""
       }
+      val stopStatement = if (SparkEnv.get != null &&
+        SparkEnv.get.conf.getBoolean("spark.sql.execution.adaptive", false)) {
+        "return false"
+      } else {
+        "continue"
+      }
+
+      s"""
+         |$evaluated
+         |${ev.code}
+         |if (${nullCheck}!${ev.value}) $stopStatement;
+       """.stripMargin
+    }
+
+    // NIKNIKNIK NOTE: this is something that is used in `genPredicate` and
+    // it seems that 'in' arg in `genPredicate` may be redundant
+    ctx.currentVars = input
+
+    // To generate the predicates we will follow this algorithm.
+    // For each predicate that is not IsNotNull, we will generate them one by one loading attributes
+    // as necessary. For each of both attributes, if there is an IsNotNull predicate we will
+    // generate that check *before* the predicate. After all of these predicates, we will generate
+    // the remaining IsNotNull checks that were not part of other predicates.
+    // This has the property of not doing redundant IsNotNull checks and taking better advantage of
+    // short-circuiting, not loading attributes until they are needed.
+    // This is very perf sensitive.
+    // TODO: revisit this. We can consider reordering predicates as well.
+    val generatedIsNotNullChecks = new Array[Boolean](notNullPreds.length)
+    val generated = otherPreds.zipWithIndex.map { case (c, i) =>
+      // NIKNIKNIK EDIT: Variables that already have been declared and initialized will be used
+      // only inside a function.
+      val input_copy = input.map { _.copy() }
+      ctx.currentVars = input_copy
+
+      val nullChecks = c.references.map { r =>
+        val idx = notNullPreds.indexWhere { n => n.asInstanceOf[IsNotNull].child.semanticEquals(r)}
+        if (idx != -1 && !generatedIsNotNullChecks(idx)) {
+          generatedIsNotNullChecks(idx) = true
+          // Use the child's output. The nullability is what the child produced.
+          genPredicate(notNullPreds(idx), input_copy, child.output)
+        } else {
+          ""
+        }
+      }.mkString("\n").trim
+
+      val funcName = ctx.freshName(s"evalPredicate_$i")
+
+      // Here we use *this* operator's output with this output's nullability since we already
+      // enforced them with the IsNotNull checks above.
+      val funcBody =
+      s"""
+         |$nullChecks
+         |${genPredicate(c, input_copy, output)}
+       """.stripMargin.trim
+      val funcCode =
+        s"""
+           |private Boolean $funcName(InternalRow ${row.value}) {
+           |  $funcBody
+           |  return true;
+           |}
+         """.stripMargin
+      ctx.addNewFunction(funcName, funcCode)
+
+      s"if (!$funcName(${row.value})) continue;"
+    }.mkString("\n")
+
+    ctx.currentVars = input
+
+    val nullChecks = notNullPreds.zipWithIndex.map { case (c, idx) =>
+      if (!generatedIsNotNullChecks(idx)) {
+        genPredicate(c, input, child.output)
+      } else {
+        ""
+      }
+    }.mkString("\n")
+
+    // Reset the isNull to false for the not-null columns, then the followed operators could
+    // generate better code (remove dead branches).
+    val resultVars = input.zipWithIndex.map { case (ev, i) =>
+      if (notNullAttributes.contains(child.output(i).exprId)) {
+        ev.isNull = "false"
+      }
+      ev
+    }
+
+    s"""
+       |$generated
+       |$nullChecks
+       |$numOutput.add(1);
+       |${consume(ctx, resultVars)}
+     """.stripMargin
+  }
+
+  /* *ORIGINAL*
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val numOutput = metricTerm(ctx, "numOutputRows")
+
+    /**
+     * Generates code for `c`, using `in` for input attributes and `attrs` for nullability.
+     */
+    def genPredicate(c: Expression, in: Seq[ExprCode], attrs: Seq[Attribute]): String = {
+      val bound = BindReferences.bindReference(c, attrs)
+      val evaluated = evaluateRequiredVariables(child.output, in, c.references)
+
+      // Generate the code for the predicate.
+      val ev = ExpressionCanonicalizer.execute(bound).genCode(ctx)
+      val nullCheck = if (bound.nullable) {
+        s"${ev.isNull} || "
+      } else {
+        s""
+      }
 
       s"""
          |$evaluated
@@ -208,7 +319,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
        |$numOutput.add(1);
        |${consume(ctx, resultVars)}
      """.stripMargin
-  }
+  } */
 
   protected override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")
