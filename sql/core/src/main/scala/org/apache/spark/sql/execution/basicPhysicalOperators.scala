@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution
 
+import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 
@@ -31,6 +32,8 @@ import org.apache.spark.sql.execution.ui.SparkListenerDriverAccumUpdates
 import org.apache.spark.sql.types.LongType
 import org.apache.spark.util.ThreadUtils
 import org.apache.spark.util.random.{BernoulliCellSampler, PoissonSampler}
+
+
 
 /** Physical plan for Project. */
 case class ProjectExec(projectList: Seq[NamedExpression], child: SparkPlan)
@@ -120,6 +123,11 @@ case class FilterExec(condition: Expression, child: SparkPlan)
   override lazy val metrics = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
 
+  // adaptive metrics
+  lazy val adaptiveMetrics = Map(
+    "numSeen" -> SQLMetrics.createMetric(sparkContext, "number of rows seen"),
+    "numCut" -> SQLMetrics.createMetric(sparkContext, "number of rows cut"))
+
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
     child.asInstanceOf[CodegenSupport].inputRDDs()
   }
@@ -128,8 +136,35 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     child.asInstanceOf[CodegenSupport].produce(ctx, this)
   }
 
-  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+  def doConsumeAdaptive(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
     val numOutput = metricTerm(ctx, "numOutputRows")
+
+    /* val adaptive = SparkEnv.get != null &&
+      SparkEnv.get.conf.getBoolean("spark.sql.execution.adaptive", false) */
+
+    // adaptive metrics
+    val numInputRows = ctx.freshName("numInputRows")
+    val numSeen = ctx.freshName("numSeen")
+    val numCut = ctx.freshName("numCut")
+    val performances = ctx.freshName("performances")
+    ctx.addMutableState("long", numInputRows, s"$numInputRows = 0;")
+    ctx.addMutableState("long[]", numSeen,
+      s"$numSeen = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
+    ctx.addMutableState("long[]", numCut,
+      s"$numCut = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
+    ctx.addMutableState("double[]", performances,
+      s"$performances = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};")
+
+    val permutations = ctx.freshName("p")
+    ctx.addMutableState("int[]", permutations,
+      s"$permutations = new int[]{${otherPreds.indices.mkString(", ")}};")
+
+    val itsTime = ctx.freshName("itsTime")
+    ctx.addNewFunction(itsTime,
+      s"private Boolean $itsTime() { return $numInputRows % 100000 == 0; }")
+
+    // genPredicate stopStatement
+    val stopStatement = "return false"
 
     /**
      * Generates code for `c`, using `in` for input attributes and `attrs` for nullability.
@@ -144,12 +179,6 @@ case class FilterExec(condition: Expression, child: SparkPlan)
         s"${ev.isNull} || "
       } else {
         s""
-      }
-      val stopStatement = if (SparkEnv.get != null &&
-        SparkEnv.get.conf.getBoolean("spark.sql.execution.adaptive", false)) {
-        "return false"
-      } else {
-        "continue"
       }
 
       s"""
@@ -173,14 +202,14 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // This is very perf sensitive.
     // TODO: revisit this. We can consider reordering predicates as well.
     val generatedIsNotNullChecks = new Array[Boolean](notNullPreds.length)
-    val generated = otherPreds.zipWithIndex.map { case (c, i) =>
+    val generatedSeq = otherPreds.map { c =>
       // NIKNIKNIK EDIT: Variables that already have been declared and initialized will be used
       // only inside a function.
-      val input_copy = input.map { _.copy() }
+      val input_copy = input.map(_.copy())
       ctx.currentVars = input_copy
 
       val nullChecks = c.references.map { r =>
-        val idx = notNullPreds.indexWhere { n => n.asInstanceOf[IsNotNull].child.semanticEquals(r)}
+        val idx = notNullPreds.indexWhere { n => n.asInstanceOf[IsNotNull].child.semanticEquals(r) }
         if (idx != -1 && !generatedIsNotNullChecks(idx)) {
           generatedIsNotNullChecks(idx) = true
           // Use the child's output. The nullability is what the child produced.
@@ -190,29 +219,100 @@ case class FilterExec(condition: Expression, child: SparkPlan)
         }
       }.mkString("\n").trim
 
-      val funcName = ctx.freshName(s"evalPredicate_$i")
-
       // Here we use *this* operator's output with this output's nullability since we already
       // enforced them with the IsNotNull checks above.
-      val funcBody =
       s"""
          |$nullChecks
          |${genPredicate(c, input_copy, output)}
        """.stripMargin.trim
-      val funcCode =
-        s"""
-           |private Boolean $funcName(InternalRow ${row.value}) {
-           |  $funcBody
-           |  return true;
-           |}
-         """.stripMargin
-      ctx.addNewFunction(funcName, funcCode)
+    }
 
-      s"if (!$funcName(${row.value})) continue;"
-    }.mkString("\n")
+    val predFuncNames: mutable.Seq[String] = mutable.Seq.fill(generatedSeq.length) {""}
+    val choosePredName = ctx.freshName("choosePredicate")
+
+    val generated =
+      generatedSeq.zipWithIndex.map {case (funcBody, i) =>
+        val funcName = ctx.freshName(s"evalPredicate_$i")
+        predFuncNames.update(i, funcName)
+        val funcCode =
+          s"""
+             |private Boolean $funcName(InternalRow ${row.value}) {
+             |  $funcBody
+             |  return true;
+             |}
+             """.stripMargin
+        ctx.addNewFunction(funcName, funcCode)
+
+        s"""
+           |if (!$choosePredName($permutations[$i], ${row.value})) continue;
+           """.stripMargin
+      }.mkString("\n")
+
+
+    val choosePredBody = predFuncNames.zipWithIndex.map {case (func, i) =>
+      s"""
+         |case $i:
+         |  $numSeen[$permutations[$i]] += 1;
+         |  if (!$func(${row.value})) {
+         |    $numCut[$permutations[$i]] += 1;
+         |    return false;
+         |  }
+         |  return true;
+       """.stripMargin
+    }
+    val choosePredCode =
+      s"""
+         |private Boolean $choosePredName(int index, InternalRow ${row.value}) {
+         |  switch (index) {
+         |    ${choosePredBody.mkString("\n")}
+         |  }
+         |  return true;
+         |}
+       """.stripMargin
+    ctx.addNewFunction(choosePredName, choosePredCode)
+
+
+    val eddy =
+      s"""
+         |if ($itsTime()) {
+         |  // update performances
+         |  for (int i=0; i<${otherPreds.length}; i++) {
+         |    $performances[i] = $numSeen[i] / (double) $numCut[i];
+         |    $numSeen[i] = 1;
+         |    $numCut[i] = 1;
+         |    $permutations[i] = i;
+         |  }
+         |  // do permutations based on $performances
+         |  // insertion sort on $performances, affecting also $permutations
+         |  for (int j, i=1; i<${otherPreds.length}; i++) {
+         |    double x = $performances[i];
+         |    int ix = $permutations[i];
+         |    for (j = i - 1; j >= 0; j--)
+         |      if ($performances[j] > x) {
+         |        $performances[j + 1] = $performances[j];
+         |        $permutations[j + 1] = $permutations[j];
+         |      } else break;
+         |
+         |    $performances[j+1] = x;
+         |    $permutations[j+1] = ix;
+         |  }
+         |
+         |  System.out.println("Permutation, Performance");
+         |  for (int i=0; i<${otherPreds.length}; i++ )
+         |    System.out.print("(" + $permutations[i] + "," + $performances[i] + "), ");
+         |  System.out.println();
+         |
+         |}
+       """.stripMargin
+
+
+//    ctx.addNewFunction("getSeen", s"public long[] getSeen() { return $numSeen; }")
+//    ctx.addNewFunction("getCut", s"public long[] getCut() { return $numCut; }")
 
     ctx.currentVars = input
 
+
+    // As for now, we leave independent null checks as they are
     val nullChecks = notNullPreds.zipWithIndex.map { case (c, idx) =>
       if (!generatedIsNotNullChecks(idx)) {
         genPredicate(c, input, child.output)
@@ -231,6 +331,8 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     }
 
     s"""
+       |$eddy
+       |$numInputRows++;
        |$generated
        |$nullChecks
        |$numOutput.add(1);
@@ -238,8 +340,15 @@ case class FilterExec(condition: Expression, child: SparkPlan)
      """.stripMargin
   }
 
-  /* *ORIGINAL*
+
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+
+    /* ADAPTIVE EDIT: route to doConsumeAdaptive */
+    if (SparkEnv.get != null
+      && SparkEnv.get.conf.getBoolean("spark.sql.execution.adaptive", false)) {
+      return doConsumeAdaptive(ctx, input, row)
+    }
+
     val numOutput = metricTerm(ctx, "numOutputRows")
 
     /**
@@ -319,7 +428,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
        |$numOutput.add(1);
        |${consume(ctx, resultVars)}
      """.stripMargin
-  } */
+  }
 
   protected override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")

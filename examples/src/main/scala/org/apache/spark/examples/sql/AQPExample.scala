@@ -20,11 +20,12 @@ object AQPExample {
 
     val df = spark.read.json("examples/src/main/resources/people.json")
     val colexpr = df.col("name") =!= "Justin"
-    //val colexpr2 = df.col("age") === 30
-    val colexpr2 = length(df.col("name")) === df.col("age")
-    val dff = df.filter(colexpr && colexpr2)
+    val colexpr2 = df.col("age") === 30
+    //val colexpr2 = length(df.col("name")) === df.col("age")
+    val dff = df.limit(3).filter(colexpr && colexpr2)
     dff.queryExecution.debug.codegen()
     dff.show()
+    df.show()
 
     spark.stop()
   }
