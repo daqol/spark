@@ -9,23 +9,43 @@ import org.apache.spark.sql.functions.length
 
 object AQPExample {
 
+  def meter[T](f: => T): Unit = {
+    val t0 = System.nanoTime()
+    val res = f
+    println(s"Res: $res, calculated in ${(System.nanoTime()-t0)/1000000} ms")
+  }
+
   def main(args: Array[String]): Unit = {
     val spark = SparkSession
       .builder()
       .appName("AQP Example")
 //      .config("spark.sql.codegen.wholeStage", value = false)
         .config("spark.sql.codegen.comments", value = true)
-        .config("spark.sql.execution.adaptive", value = true)
+        .config("spark.sql.execution.AQP.filter.enabled", value = true)
+//        .config("spark.sql.execution.AQP.filter.collectRate", value = true)
+//        .config("spark.sql.execution.AQP.filter.calculateRate", value = true)
       .getOrCreate()
 
-    val df = spark.read.json("examples/src/main/resources/people.json")
-    val colexpr = df.col("name") =!= "Justin"
-    val colexpr2 = df.col("age") === 30
+    import spark.implicits._
+
+    //val df = spark.read.json("examples/src/main/resources/people.json")
+    //val df2 = spark.read.json("examples/src/main/resources/employees.json")
+    //val df = spark.read.option("nullValue", "?").option("header", "true").option("inferSchema", "true").csv("/home/nikniknik/linkage/data")
+    val df = spark.read.parquet("/home/nikniknik/linkage.parquet")
+
+    //df.count()
+
     //val colexpr2 = length(df.col("name")) === df.col("age")
-    val dff = df.limit(3).filter(colexpr && colexpr2)
+    //val dff = df.filter('name =!= "Justin" && 'age === 30)
+
+    val dff = df.filter('cmp_plz === 0 && 'cmp_fname_c1 === 1) //&& 'cmp_lname_c1 === 0 && 'cmp_sex === 1 && 'cmp_bm === 1 && 'cmp_bd === 0 && 'cmp_by === 0) // && 'id_1 === 1)
+
     dff.queryExecution.debug.codegen()
-    dff.show()
-    df.show()
+    meter {dff.count()}
+    // df.show()
+
+//    val dfj = df1.join(df2, df1.col("name") === df2.col("name"))
+//    dfj.queryExecution.debug.codegen()
 
     spark.stop()
   }
