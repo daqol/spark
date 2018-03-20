@@ -222,8 +222,15 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // configurations
     val collectRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.collectRate", 1000)
     val calculateRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.calculateRate", 100000) // scalastyle:ignore
+    val eddyDebug = SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.debug.eddy", false)
 
     // adaptive metrics
+    // numInputRows: long, number of input rows in general. This is identical to scanOutputRows,
+    //               if scan is preceding
+    // numSeen, numCut: long arrays, in each place they have number of rows seen and cut for
+    //                  corresponding predicate
+    // performances: long array, it kepts performances of predicates based on numSeen, numCut
+    //               It is updated based on calculateRate conf
     val numInputRows = ctx.freshName("numInputRows")
     val numSeen = ctx.freshName("numSeen")
     val numCut = ctx.freshName("numCut")
@@ -236,62 +243,26 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     ctx.addMutableState("double[]", performances,
       s"$performances = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};")
 
+    // permutations: int array, it keeps a permutation of predicates based on their perforamnce
+    //               at that moment
     val permutations = ctx.freshName("p")
     ctx.addMutableState("int[]", permutations,
       s"$permutations = new int[]{${otherPreds.indices.mkString(", ")}};")
 
     // collect, calculate performances rates
-    val itsTimeToCalculate = ctx.freshName("itsTimeToCalculate")
-    ctx.addNewFunction(itsTimeToCalculate,
-      s"""
-         |private final Boolean $itsTimeToCalculate() {
-         |  return $numInputRows % $calculateRate == 100;
-         |}
-       """.stripMargin)
+    val itsTimeToCalculate = s"$numInputRows % $calculateRate == ${30*collectRate}"
+    val itsTimeToCollect = s"$numInputRows % $collectRate == 0"
 
-    val itsTimeToCollect = ctx.freshName("itsTimeToCollect")
-    ctx.addNewFunction(itsTimeToCollect,
-      s"""
-         |private final Boolean $itsTimeToCollect() {
-         |  return $numInputRows % $collectRate == 0;
-         |}
-       """.stripMargin)
-
-    val predFuncNames: mutable.Seq[String] = mutable.Seq.fill(generatedSeq.length) {""}
+    // choosePredicate: function that will evaluate a predicate, based on its argument.
+    //                  e.g. for evaluating second predicate => choosePredicate(1)
     val choosePredName = ctx.freshName("choosePredicate")
 
-    val generated =
-      generatedSeq.zipWithIndex.map {case (funcBody, i) =>
-        val funcName = ctx.freshName(s"evalPredicate_$i")
-        predFuncNames.update(i, funcName)
-        val funcCode =
-          s"""
-             |private final Boolean $funcName() {
-             |  $funcBody
-             |  return true;
-             |}
-             """.stripMargin
-        ctx.addNewFunction(funcName, funcCode)
-
-        s"""
-           |if (!$choosePredName($permutations[$i])) continue;
-           """.stripMargin
-      }.mkString("\n")
-
-
-    val choosePredBody = predFuncNames.zipWithIndex.map {case (func, i) =>
+    val choosePredBody = generatedSeq.zipWithIndex.map { case (predicate, i) =>
       s"""
-         |case $i:
-         |  if ($itsTimeToCollect()) {
-         |    $numSeen[$i] += 1;
-         |    if (!$func()) {
-         |      $numCut[$i] += 1;
-         |      return false;
-         |    }
-         |  } else {
-         |    return $func();
-         |  }
+         |case $i: {
+         |  $predicate
          |  return true;
+         |}
        """.stripMargin
     }
     val choosePredCode =
@@ -305,10 +276,18 @@ case class FilterExec(condition: Expression, child: SparkPlan)
        """.stripMargin
     ctx.addNewFunction(choosePredName, choosePredCode)
 
-
+    // eddy: block of code that calculates predicate performances and do appropriate permutation
+    val eddyDebugCode = if (eddyDebug) {
+      s"""
+         |StringBuilder sb = new StringBuilder();
+         |for (int i=0; i<${otherPreds.length}; i++)
+         |  sb.append("(" + $permutations[i] + "," + $performances[i] + "), ");
+         |System.out.println(sb.toString());
+       """.stripMargin
+    } else ""
     val eddy =
       s"""
-         |if ($itsTimeToCalculate()) {
+         |if ($itsTimeToCalculate) {
          |  // update performances
          |  for (int i=0; i<${otherPreds.length}; i++) {
          |    $performances[i] = $numSeen[i] / (double) $numCut[i];
@@ -330,17 +309,39 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |    $performances[j+1] = x;
          |    $permutations[j+1] = ix;
          |  }
-         |/*
-         |  for (int i=0; i<${otherPreds.length}; i++ )
-         |    System.out.print("(" + $permutations[i] + "," + $performances[i] + "), ");
-         |  System.out.println();
-         |*/
+         |  $eddyDebugCode
          |}
        """.stripMargin
 
+    // Total block of code in processNext for filter will be a number of if statements that each
+    // will call choosePredicate to evaluate all predicates in order based on current permutation.
+    // But, we have 2 'modes' for this. Either wwe collect statistics from current row or not.
+    // These 2 cases will be wrapped in an external if statement.
+    val generatedWithoutCollect =
+      generatedSeq.indices.map { i =>
+        s"""
+           |if (!$choosePredName($permutations[$i])) continue;
+           """.stripMargin
+      }.mkString("\n")
+    val generatedWithCollect =
+      generatedSeq.indices.map { i =>
+        s"""
+           |$numSeen[$permutations[$i]] += 1;
+           |if (!$choosePredName($permutations[$i])) {
+           |  $numCut[$permutations[$i]] += 1;
+           |  continue;
+           |}
+           """.stripMargin
+      }.mkString("\n")
+    val generated =
+      s"""
+         |if ($itsTimeToCollect) {
+         |  $generatedWithCollect
+         |} else {
+         |  $generatedWithoutCollect
+         |}
+       """.stripMargin
 
-//    ctx.addNewFunction("getSeen", s"public long[] getSeen() { return $numSeen; }")
-//    ctx.addNewFunction("getCut", s"public long[] getCut() { return $numCut; }")
 
     ctx.currentVars = input
 
