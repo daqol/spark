@@ -223,25 +223,31 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     val collectRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.collectRate", 1000)
     val calculateRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.calculateRate", 100000) // scalastyle:ignore
     val eddyDebug = SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.debug.eddy", false)
+    val momentum = SparkEnv.get.conf.getDouble("spark.sql.execution.AQP.filter.momentum", 0.3)
 
     // adaptive metrics
     // numInputRows: long, number of input rows in general. This is identical to scanOutputRows,
     //               if scan is preceding
     // numSeen, numCut: long arrays, in each place they have number of rows seen and cut for
     //                  corresponding predicate
-    // performances: long array, it kepts performances of predicates based on numSeen, numCut
+    // cost: long array, in each place it has time that took a predicate to finish
+    //
+    // performance: long array, it kepts performances of predicates based on numSeen, numCut
     //               It is updated based on calculateRate conf
     val numInputRows = ctx.freshName("numInputRows")
     val numSeen = ctx.freshName("numSeen")
     val numCut = ctx.freshName("numCut")
-    val performances = ctx.freshName("performances")
+    val cost = ctx.freshName("cost")
+    val performance = ctx.freshName("performance")
     ctx.addMutableState("long", numInputRows, s"$numInputRows = 0;")
     ctx.addMutableState("long[]", numSeen,
       s"$numSeen = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
     ctx.addMutableState("long[]", numCut,
       s"$numCut = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
-    ctx.addMutableState("double[]", performances,
-      s"$performances = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};")
+    ctx.addMutableState("long[]", cost,
+      s"$cost = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
+    ctx.addMutableState("double[]", performance,
+      s"$performance = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};")
 
     // permutations: int array, it keeps a permutation of predicates based on their perforamnce
     //               at that moment
@@ -249,7 +255,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     ctx.addMutableState("int[]", permutations,
       s"$permutations = new int[]{${otherPreds.indices.mkString(", ")}};")
 
-    // collect, calculate performances rates
+    // collect, calculate performance rates
     val itsTimeToCalculate = s"$numInputRows % $calculateRate == ${30*collectRate}"
     val itsTimeToCollect = s"$numInputRows % $collectRate == 0"
 
@@ -281,37 +287,48 @@ case class FilterExec(condition: Expression, child: SparkPlan)
       s"""
          |StringBuilder sb = new StringBuilder();
          |for (int i=0; i<${otherPreds.length}; i++)
-         |  sb.append("(" + $permutations[i] + "," + $performances[i] + "), ");
+         |  sb.append("(" + $permutations[i] + "," + $performance[i] + "), ");
          |System.out.println(sb.toString());
        """.stripMargin
     } else ""
+    // scalastyle:off
     val eddy =
       s"""
          |if ($itsTimeToCalculate) {
-         |  // update performances
+         |  // convert costs to average and find max average cost
+         |  long max_cost = 0;
          |  for (int i=0; i<${otherPreds.length}; i++) {
-         |    $performances[i] = $numSeen[i] / (double) $numCut[i];
-         |    $numSeen[i] = 2;
+         |    $cost[i] /= $numSeen[i];
+         |    if ($cost[i] > max_cost)
+         |      max_cost = $cost[i];
+         |  }
+         |
+         |  // update performance
+         |  for (int i=0; i<${otherPreds.length}; i++) {
+         |    $performance[i] = $momentum*$performance[i] + ($cost[i] / (double) max_cost)*($numSeen[i] / (double) $numCut[i]);
+         |    $numSeen[i] = 1;
          |    $numCut[i] = 1;
+         |    $cost[i] = 0;
          |    $permutations[i] = i;
          |  }
-         |  // do permutations based on $performances
-         |  // insertion sort on $performances, affecting also $permutations
+         |  // do permutations based on $performance
+         |  // insertion sort on $performance, affecting also $permutations
          |  for (int j, i=1; i<${otherPreds.length}; i++) {
-         |    double x = $performances[i];
+         |    double x = $performance[i];
          |    int ix = $permutations[i];
          |    for (j = i - 1; j >= 0; j--)
-         |      if ($performances[j] > x) {
-         |        $performances[j + 1] = $performances[j];
+         |      if ($performance[j] > x) {
+         |        $performance[j + 1] = $performance[j];
          |        $permutations[j + 1] = $permutations[j];
          |      } else break;
          |
-         |    $performances[j+1] = x;
+         |    $performance[j+1] = x;
          |    $permutations[j+1] = ix;
          |  }
          |  $eddyDebugCode
          |}
        """.stripMargin
+    // scalastyle:on
 
     // Total block of code in processNext for filter will be a number of if statements that each
     // will call choosePredicate to evaluate all predicates in order based on current permutation.
@@ -327,7 +344,10 @@ case class FilterExec(condition: Expression, child: SparkPlan)
       generatedSeq.indices.map { i =>
         s"""
            |$numSeen[$permutations[$i]] += 1;
-           |if (!$choosePredName($permutations[$i])) {
+           |t0 = System.nanoTime();
+           |predResult = $choosePredName($permutations[$i]);
+           |$cost[$permutations[$i]] += System.nanoTime() - t0;
+           |if (!predResult) {
            |  $numCut[$permutations[$i]] += 1;
            |  continue;
            |}
@@ -336,6 +356,8 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     val generated =
       s"""
          |if ($itsTimeToCollect) {
+         |  long t0;
+         |  boolean predResult;
          |  $generatedWithCollect
          |} else {
          |  $generatedWithoutCollect
@@ -379,7 +401,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
 
     /* ADAPTIVE EDIT: route to doConsumeAdaptive */
-    if (SparkEnv.get != null
+    if (otherPreds.lengthCompare(1) > 0 && SparkEnv.get != null
       && SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.filter.enabled", false)) {
       return doConsumeAdaptive(ctx, input, row)
     }
