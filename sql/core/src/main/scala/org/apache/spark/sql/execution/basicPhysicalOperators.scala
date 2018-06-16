@@ -221,7 +221,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
 
     // configurations
     val collectRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.collectRate", 1000)
-    val calculateRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.calculateRate", 100000) // scalastyle:ignore
+    val calculateRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.calculateRate", 1000000) // scalastyle:ignore
     val eddyDebug = SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.debug.eddy", false)
     val momentum = SparkEnv.get.conf.getDouble("spark.sql.execution.AQP.filter.momentum", 0.3)
 
@@ -245,15 +245,16 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     ctx.addMutableState("long[]", numCut,
       s"$numCut = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
     ctx.addMutableState("long[]", cost,
-      s"$cost = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
-    ctx.addMutableState("double[]", performance,
-      s"$performance = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};")
+      s"$cost = new long[]{${Array.fill(otherPreds.length)(60).mkString(", ")}};")
+    ctx.addMutableState("static double[]",
+      s"$performance = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};", "")
+      // s"$performance = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};")
 
-    // permutations: int array, it keeps a permutation of predicates based on their perforamnce
+    // permutations: int array, it keeps a permutation of predicates based on their performance
     //               at that moment
     val permutations = ctx.freshName("p")
-    ctx.addMutableState("int[]", permutations,
-      s"$permutations = new int[]{${otherPreds.indices.mkString(", ")}};")
+    ctx.addMutableState("static int[]",
+      s"$permutations = new int[]{${otherPreds.indices.mkString(", ")}};", "")
 
     // collect, calculate performance rates
     val itsTimeToCalculate = s"$numInputRows % $calculateRate == ${30*collectRate}"
@@ -283,15 +284,26 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     ctx.addNewFunction(choosePredName, choosePredCode)
 
     // eddy: block of code that calculates predicate performances and do appropriate permutation
+    // scalastyle:off
     val eddyDebugCode = if (eddyDebug) {
       s"""
          |StringBuilder sb = new StringBuilder();
+         |sb.append("(predicate, rate)\t\t");
          |for (int i=0; i<${otherPreds.length}; i++)
-         |  sb.append("(" + $permutations[i] + "," + $performance[i] + "), ");
+         |  sb.append("(" + $permutations[i] + "," + String.format("%.2f",tempPerformance[i]) + "), ");
          |System.out.println(sb.toString());
        """.stripMargin
     } else ""
-    // scalastyle:off
+    val eddyDebugCodeTemp = if (eddyDebug) {
+      s"""
+         |StringBuilder sbT = new StringBuilder();
+         |sbT.append("(pred num, seen, cut, avg cost)");
+         |for (int i=0; i<${otherPreds.length}; i++)
+         |  sbT.append("\t(" + $permutations[i] + "," + $numSeen[$permutations[i]] + ","
+         |            + $numCut[$permutations[i]] + "," + $cost[$permutations[i]] + "), ");
+         |System.out.println(sbT.toString());
+       """.stripMargin
+    } else ""
     val eddy =
       s"""
          |if ($itsTimeToCalculate) {
@@ -303,26 +315,31 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |      max_cost = $cost[i];
          |  }
          |
+         |  $eddyDebugCodeTemp
+         |
          |  // update performance
          |  for (int i=0; i<${otherPreds.length}; i++) {
          |    $performance[i] = $momentum*$performance[i] + ($cost[i] / (double) max_cost)*($numSeen[i] / (double) $numCut[i]);
          |    $numSeen[i] = 1;
          |    $numCut[i] = 1;
-         |    $cost[i] = 0;
+         |    $cost[i] = 60;
          |    $permutations[i] = i;
          |  }
          |  // do permutations based on $performance
          |  // insertion sort on $performance, affecting also $permutations
+         |  double[] tempPerformance = new double[${otherPreds.length}];
+         |  tempPerformance[0] = $performance[0];
          |  for (int j, i=1; i<${otherPreds.length}; i++) {
-         |    double x = $performance[i];
+         |    tempPerformance[i] = $performance[i];
+         |    double x = tempPerformance[i];
          |    int ix = $permutations[i];
          |    for (j = i - 1; j >= 0; j--)
-         |      if ($performance[j] > x) {
-         |        $performance[j + 1] = $performance[j];
+         |      if (tempPerformance[j] > x) {
+         |        tempPerformance[j + 1] = tempPerformance[j];
          |        $permutations[j + 1] = $permutations[j];
          |      } else break;
          |
-         |    $performance[j+1] = x;
+         |    tempPerformance[j+1] = x;
          |    $permutations[j+1] = ix;
          |  }
          |  $eddyDebugCode
@@ -332,7 +349,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
 
     // Total block of code in processNext for filter will be a number of if statements that each
     // will call choosePredicate to evaluate all predicates in order based on current permutation.
-    // But, we have 2 'modes' for this. Either wwe collect statistics from current row or not.
+    // But, we have 2 'modes' for this. Either we collect statistics from current row or not.
     // These 2 cases will be wrapped in an external if statement.
     val generatedWithoutCollect =
       generatedSeq.indices.map { i =>
@@ -400,7 +417,8 @@ case class FilterExec(condition: Expression, child: SparkPlan)
 
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
 
-    /* ADAPTIVE EDIT: route to doConsumeAdaptive */
+    /* ADAPTIVE EDIT: route to doConsumeAdaptive if adaptive mode is on and
+    there are more than 1 conjunctive predicates */
     if (otherPreds.lengthCompare(1) > 0 && SparkEnv.get != null
       && SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.filter.enabled", false)) {
       return doConsumeAdaptive(ctx, input, row)

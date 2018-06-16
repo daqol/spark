@@ -23,8 +23,8 @@ object AQPExample {
         .config("spark.sql.parquet.filterPushdown", value=false)
 //        .config("spark.sql.codegen.comments", value = true)
         .config("spark.sql.execution.AQP.filter.enabled", value = true)
-//        .config("spark.sql.execution.AQP.debug.eddy", value = true)
-//        .config("spark.sql.execution.AQP.filter.collectRate", value = true)
+        .config("spark.sql.execution.AQP.debug.eddy", value = true)
+//        .config("spark.sql.execution.AQP.filter.collectRate", value = 10000)
         .config("spark.sql.execution.AQP.filter.calculateRate", value = 10000000)
         .config("spark.sql.execution.AQP.filter.momentum", value = 0.3)
       .getOrCreate()
@@ -44,14 +44,19 @@ object AQPExample {
 
     //val dff = df.filter('cmp_plz === 0 && 'cmp_fname_c1 === 1) //&& 'cmp_lname_c1 === 0 && 'cmp_sex === 1 && 'cmp_bm === 1 && 'cmp_bd === 0 && 'cmp_by === 0) // && 'id_1 === 1)
 
-    val dff = df.filter(length('gram) === 1 && 'year > 0 && 'times > 0 && 'books === 0)
+    //val dff = df.filter('gram =!= "does not exist" && 'year > 0 && 'times > 0 && 'books < 0)
+    val dff = df.filter(length('gram) < 4 && 'books > 0 && 'year > 1900 && 'times > 200)
 
-    //dff.queryExecution.debug.codegen()
+    dff.queryExecution.debug.codegen()
     meter {dff.count()}
     // df.show()
+/*
+    val dfs = spark.readStream.schema(df.schema).parquet("../../1-grams.parquet")
+    val dffs = dfs.filter('gram =!= "does not exist" && 'year > 0 && 'times > 0 && 'books < 0) // .agg(count("*"))
+    val q = dffs.writeStream.outputMode("update").format("console").start()
 
-//    val dfj = df1.join(df2, df1.col("name") === df2.col("name"))
-//    dfj.queryExecution.debug.codegen()
+    q.awaitTermination(20000)*/
+    // q.stop()
 
     spark.stop()
   }
