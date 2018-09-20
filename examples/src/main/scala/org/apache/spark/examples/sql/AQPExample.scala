@@ -23,7 +23,7 @@ object AQPExample {
         .config("spark.sql.parquet.filterPushdown", value=false)
 //        .config("spark.sql.codegen.comments", value = true)
         .config("spark.sql.execution.AQP.filter.enabled", value = true)
-        .config("spark.sql.execution.AQP.debug.eddy", value = true)
+        .config("spark.sql.execution.AQP.debug", value = true)
 //        .config("spark.sql.execution.AQP.filter.collectRate", value = 10000)
         .config("spark.sql.execution.AQP.filter.calculateRate", value = 10000000)
         .config("spark.sql.execution.AQP.filter.momentum", value = 0.3)

@@ -167,6 +167,8 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // NIKNIKNIK NOTE: this is something that is used in `genPredicate` and
     // it seems that 'in' arg in `genPredicate` may be redundant
     ctx.currentVars = input
+
+
     val prereq = {
       val declared = ctx.mutableStates.map(_._2)
       val allpossible = input.head.code.split("\n", 3)(1).split(" = ").last.split('.')
@@ -222,7 +224,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // configurations
     val collectRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.collectRate", 1000)
     val calculateRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.calculateRate", 1000000) // scalastyle:ignore
-    val eddyDebug = SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.debug.eddy", false)
+    val eddyDebug = SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.debug", false)
     val momentum = SparkEnv.get.conf.getDouble("spark.sql.execution.AQP.filter.momentum", 0.3)
 
     // adaptive metrics
@@ -259,6 +261,8 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // collect, calculate performance rates
     val itsTimeToCalculate = s"$numInputRows % $calculateRate == ${30*collectRate}"
     val itsTimeToCollect = s"$numInputRows % $collectRate == 0"
+    val canCalculate = ctx.freshName("canCalculate")
+    ctx.addMutableState("static boolean", s"$canCalculate = true;", "")
 
     // choosePredicate: function that will evaluate a predicate, based on its argument.
     //                  e.g. for evaluating second predicate => choosePredicate(1)
@@ -283,6 +287,9 @@ case class FilterExec(condition: Expression, child: SparkPlan)
        """.stripMargin
     ctx.addNewFunction(choosePredName, choosePredCode)
 
+    val temp_permutations = ctx.freshName("temp_p")
+    val tempPerformance = ctx.freshName("tempPerformance")
+
     // eddy: block of code that calculates predicate performances and do appropriate permutation
     // scalastyle:off
     val eddyDebugCode = if (eddyDebug) {
@@ -290,7 +297,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |StringBuilder sb = new StringBuilder();
          |sb.append("(predicate, rate)\t\t");
          |for (int i=0; i<${otherPreds.length}; i++)
-         |  sb.append("(" + $permutations[i] + "," + String.format("%.2f",tempPerformance[i]) + "), ");
+         |  sb.append("(" + $permutations[i] + "," + String.format("%.2f",$tempPerformance[i]) + "), ");
          |System.out.println(sb.toString());
        """.stripMargin
     } else ""
@@ -306,7 +313,8 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     } else ""
     val eddy =
       s"""
-         |if ($itsTimeToCalculate) {
+         |if ($itsTimeToCalculate && $canCalculate) {
+         |  $canCalculate = false;
          |  // convert costs to average and find max average cost
          |  long max_cost = 0;
          |  for (int i=0; i<${otherPreds.length}; i++) {
@@ -317,32 +325,37 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |
          |  $eddyDebugCodeTemp
          |
+         |  int[] $temp_permutations = new int[${otherPreds.length}];
          |  // update performance
          |  for (int i=0; i<${otherPreds.length}; i++) {
          |    $performance[i] = $momentum*$performance[i] + ($cost[i] / (double) max_cost)*($numSeen[i] / (double) $numCut[i]);
          |    $numSeen[i] = 1;
          |    $numCut[i] = 1;
          |    $cost[i] = 60;
-         |    $permutations[i] = i;
+         |    $temp_permutations[i] = i;
          |  }
          |  // do permutations based on $performance
-         |  // insertion sort on $performance, affecting also $permutations
-         |  double[] tempPerformance = new double[${otherPreds.length}];
-         |  tempPerformance[0] = $performance[0];
+         |  // insertion sort based on $performance, that affects $temp_permutations
+         |  double[] $tempPerformance = new double[${otherPreds.length}];
+         |  $tempPerformance[0] = $performance[0];
          |  for (int j, i=1; i<${otherPreds.length}; i++) {
-         |    tempPerformance[i] = $performance[i];
-         |    double x = tempPerformance[i];
-         |    int ix = $permutations[i];
+         |    $tempPerformance[i] = $performance[i];
+         |    double x = $tempPerformance[i];
+         |    int ix = $temp_permutations[i];
          |    for (j = i - 1; j >= 0; j--)
-         |      if (tempPerformance[j] > x) {
-         |        tempPerformance[j + 1] = tempPerformance[j];
-         |        $permutations[j + 1] = $permutations[j];
+         |      if ($tempPerformance[j] > x) {
+         |        $tempPerformance[j + 1] = $tempPerformance[j];
+         |        $temp_permutations[j + 1] = $temp_permutations[j];
          |      } else break;
          |
-         |    tempPerformance[j+1] = x;
-         |    $permutations[j+1] = ix;
+         |    $tempPerformance[j+1] = x;
+         |    $temp_permutations[j+1] = ix;
          |  }
+         |
+         |  $permutations = $temp_permutations;
+         |
          |  $eddyDebugCode
+         |  $canCalculate = true;
          |}
        """.stripMargin
     // scalastyle:on
@@ -366,7 +379,8 @@ case class FilterExec(condition: Expression, child: SparkPlan)
            |$cost[$permutations[$i]] += System.nanoTime() - t0;
            |if (!predResult) {
            |  $numCut[$permutations[$i]] += 1;
-           |  continue;
+           |  continue_flag = true;
+           |//  continue;
            |}
            """.stripMargin
       }.mkString("\n")
@@ -375,7 +389,9 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |if ($itsTimeToCollect) {
          |  long t0;
          |  boolean predResult;
+         |  boolean continue_flag = false;
          |  $generatedWithCollect
+         |  if (continue_flag) continue;
          |} else {
          |  $generatedWithoutCollect
          |}
