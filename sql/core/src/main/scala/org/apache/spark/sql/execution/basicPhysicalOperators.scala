@@ -143,6 +143,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     val stopStatement = "return false"
 
     /**
+     * `doConsume` doc:
      * Generates code for `c`, using `in` for input attributes and `attrs` for nullability.
      */
     def genPredicate(c: Expression, in: Seq[ExprCode], attrs: Seq[Attribute]): String = {
@@ -164,8 +165,6 @@ case class FilterExec(condition: Expression, child: SparkPlan)
        """.stripMargin
     }
 
-    // NIKNIKNIK NOTE: this is something that is used in `genPredicate` and
-    // it seems that 'in' arg in `genPredicate` may be redundant
     ctx.currentVars = input
 
 
@@ -186,6 +185,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
       }
     }
 
+    // `doConsume` comment:
     // To generate the predicates we will follow this algorithm.
     // For each predicate that is not IsNotNull, we will generate them one by one loading attributes
     // as necessary. For each of both attributes, if there is an IsNotNull predicate we will
@@ -194,11 +194,13 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // This has the property of not doing redundant IsNotNull checks and taking better advantage of
     // short-circuiting, not loading attributes until they are needed.
     // This is very perf sensitive.
-    // TODO: revisit this. We can consider reordering predicates as well.
     val generatedIsNotNullChecks = new Array[Boolean](notNullPreds.length)
     val generatedSeq = otherPreds.map { c =>
-      // NIKNIKNIK EDIT: Variables that already have been declared and initialized will be used
-      // only inside a function.
+
+      // In `doConsume` every variable is declared and initialized once in whole code, as all
+      // variables live in the same block of code. But in `doConsumeAdaptive` variables does
+      // not exist necessarily in the same block and we don't know their order. Thus, we have to
+      // declare and initialize variables in every function that they appear.
       val input_copy = input.map(_.copy())
       ctx.currentVars = input_copy
 
@@ -206,6 +208,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
         val idx = notNullPreds.indexWhere { n => n.asInstanceOf[IsNotNull].child.semanticEquals(r) }
         if (idx != -1 && !generatedIsNotNullChecks(idx)) {
           generatedIsNotNullChecks(idx) = true
+          // `doConsume` comment:
           // Use the child's output. The nullability is what the child produced.
           genPredicate(notNullPreds(idx), input_copy, child.output)
         } else {
@@ -213,6 +216,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
         }
       }.mkString("\n").trim
 
+      // `doConsume` comment:
       // Here we use *this* operator's output with this output's nullability since we already
       // enforced them with the IsNotNull checks above.
       s"""
@@ -224,7 +228,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // configurations
     val collectRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.collectRate", 1000)
     val calculateRate = SparkEnv.get.conf.getInt("spark.sql.execution.AQP.filter.calculateRate", 1000000) // scalastyle:ignore
-    val eddyDebug = SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.debug", false)
+    val debug = SparkEnv.get.conf.getBoolean("spark.sql.execution.AQP.debug", false)
     val momentum = SparkEnv.get.conf.getDouble("spark.sql.execution.AQP.filter.momentum", 0.3)
 
     // adaptive metrics
@@ -234,8 +238,9 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     //                  corresponding predicate
     // cost: long array, in each place it has time that took a predicate to finish
     //
-    // performance: long array, it kepts performances of predicates based on numSeen, numCut
-    //               It is updated based on calculateRate conf
+    // performance: static long array, it keeps performances of predicates based on numSeen, numCut
+    //               It is updated based on calculateRate conf. It's static, that means it is
+    //               shared among all Tasks in an Executor.
     val numInputRows = ctx.freshName("numInputRows")
     val numSeen = ctx.freshName("numSeen")
     val numCut = ctx.freshName("numCut")
@@ -252,8 +257,8 @@ case class FilterExec(condition: Expression, child: SparkPlan)
       s"$performance = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};", "")
       // s"$performance = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};")
 
-    // permutations: int array, it keeps a permutation of predicates based on their performance
-    //               at that moment
+    // permutations: static int array, it keeps a permutation of predicates based on their
+    //               performance at that moment
     val permutations = ctx.freshName("p")
     ctx.addMutableState("static int[]",
       s"$permutations = new int[]{${otherPreds.indices.mkString(", ")}};", "")
@@ -261,6 +266,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // collect, calculate performance rates
     val itsTimeToCalculate = s"$numInputRows % $calculateRate == ${30*collectRate}"
     val itsTimeToCollect = s"$numInputRows % $collectRate == 0"
+    // canCalculate: a lock for preventing Tasks to conflict in performances calculations
     val canCalculate = ctx.freshName("canCalculate")
     ctx.addMutableState("static boolean", s"$canCalculate = true;", "")
 
@@ -290,9 +296,10 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     val temp_permutations = ctx.freshName("temp_p")
     val tempPerformance = ctx.freshName("tempPerformance")
 
-    // eddy: block of code that calculates predicate performances and do appropriate permutation
+    // performanceCalc: block of code that calculates predicate performances and do appropriate
+    //                  permutation
     // scalastyle:off
-    val eddyDebugCode = if (eddyDebug) {
+    val debugCode = if (debug) {
       s"""
          |StringBuilder sb = new StringBuilder();
          |sb.append("(predicate, rate)\t\t");
@@ -301,7 +308,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |System.out.println(sb.toString());
        """.stripMargin
     } else ""
-    val eddyDebugCodeTemp = if (eddyDebug) {
+    val debugCodeTemp = if (debug) {
       s"""
          |StringBuilder sbT = new StringBuilder();
          |sbT.append("(pred num, seen, cut, avg cost)");
@@ -311,7 +318,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |System.out.println(sbT.toString());
        """.stripMargin
     } else ""
-    val eddy =
+    val performanceCalc =
       s"""
          |if ($itsTimeToCalculate && $canCalculate) {
          |  $canCalculate = false;
@@ -323,7 +330,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |      max_cost = $cost[i];
          |  }
          |
-         |  $eddyDebugCodeTemp
+         |  $debugCodeTemp
          |
          |  int[] $temp_permutations = new int[${otherPreds.length}];
          |  // update performance
@@ -354,7 +361,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
          |
          |  $permutations = $temp_permutations;
          |
-         |  $eddyDebugCode
+         |  $debugCode
          |  $canCalculate = true;
          |}
        """.stripMargin
@@ -400,7 +407,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
 
     ctx.currentVars = input
 
-
+    // `doConsume` comment:
     // As for now, we leave independent null checks as they are
     val nullChecks = notNullPreds.zipWithIndex.map { case (c, idx) =>
       if (!generatedIsNotNullChecks(idx)) {
@@ -410,6 +417,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
       }
     }.mkString("\n")
 
+    // `doConsume` comment:
     // Reset the isNull to false for the not-null columns, then the followed operators could
     // generate better code (remove dead branches).
     val resultVars = input.zipWithIndex.map { case (ev, i) =>
@@ -421,7 +429,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
 
     s"""
        |this.$prereq = $prereq;
-       |$eddy
+       |$performanceCalc
        |$numInputRows++;
        |$generated
        |$nullChecks
