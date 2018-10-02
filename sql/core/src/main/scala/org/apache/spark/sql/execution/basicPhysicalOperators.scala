@@ -371,21 +371,22 @@ case class FilterExec(condition: Expression, child: SparkPlan)
     // will call choosePredicate to evaluate all predicates in order based on current permutation.
     // But, we have 2 'modes' for this. Either we collect statistics from current row or not.
     // These 2 cases will be wrapped in an external if statement.
+    val permutationsSnap = ctx.freshName("permutationsSnap")
     val generatedWithoutCollect =
       generatedSeq.indices.map { i =>
         s"""
-           |if (!$choosePredName($permutations[$i])) continue;
+           |if (!$choosePredName($permutationsSnap[$i])) continue;
            """.stripMargin
       }.mkString("\n")
     val generatedWithCollect =
       generatedSeq.indices.map { i =>
         s"""
-           |$numSeen[$permutations[$i]] += 1;
+           |$numSeen[$permutationsSnap[$i]] += 1;
            |t0 = System.nanoTime();
-           |predResult = $choosePredName($permutations[$i]);
-           |$cost[$permutations[$i]] += System.nanoTime() - t0;
+           |predResult = $choosePredName($permutationsSnap[$i]);
+           |$cost[$permutationsSnap[$i]] += System.nanoTime() - t0;
            |if (!predResult) {
-           |  $numCut[$permutations[$i]] += 1;
+           |  $numCut[$permutationsSnap[$i]] += 1;
            |  continue_flag = true;
            |//  continue;
            |}
@@ -393,6 +394,7 @@ case class FilterExec(condition: Expression, child: SparkPlan)
       }.mkString("\n")
     val generated =
       s"""
+         |int[] $permutationsSnap = $permutations;
          |if ($itsTimeToCollect) {
          |  long t0;
          |  boolean predResult;
